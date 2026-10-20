@@ -46,16 +46,10 @@ print("Embedding model loaded!")
 ## CREATE / UPDATE THE CHROMA VECTOR STORE
 # A separate database avoids mixing with your old database.
 
+persist_directory = "my_chroma_db"
+collection_name = "chat_with_pdf"
 
-
-persist_directory = "my_chroma_db_rag"
-collection_name = "resume_rag"
-
-vector_store = Chroma(
-    collection_name=collection_name,
-    embedding_function=embedding_function,
-    persist_directory=persist_directory
-)
+vector_store = Chroma(collection_name=collection_name,embedding_function=embedding_function,persist_directory=persist_directory)
 
 # Stable IDs update matching chunks on subsequent runs
 # instead of repeatedly adding identical chunks.
@@ -112,8 +106,7 @@ Question:
 {question}
 """,
     input_variables=["context", "question"],
-    partial_variables={
-        "format_instructions": parser.get_format_instructions()})
+    partial_variables={"format_instructions": parser.get_format_instructions()})
 
 
 ## creating the rag question answer function
@@ -168,15 +161,11 @@ for doc in relevant_docs:
     print("Page:", doc.metadata.get("page", 0) + 1)
     print("-" * 40)
 
-
-# ============================================================
 ## Testing the rag chain
 
 print("\n========== QUESTION 1 ==========")
 
-result = answer_pdf_question(
-    "What certificates are mentioned in my resume?")
-
+result = answer_pdf_question("What certificates are mentioned in my resume?")
 print("Answer:", result.answer)
 print("Found in document:", result.found_in_document)
 print("Source pages:", result.source_pages)
@@ -184,12 +173,9 @@ print("Source pages:", result.source_pages)
 
 print("\n========== QUESTION 2 ==========")
 
-result = answer_pdf_question(
-    "What programming languages are mentioned in my resume?")
+result = answer_pdf_question("What programming languages are mentioned in my resume?")
 
 print("Answer:", result.answer)
 print("Found in document:", result.found_in_document)
 print("Source pages:", result.source_pages)
-
-
 print("\nRAG pipeline completed!")
