@@ -1,163 +1,360 @@
 import os
 import streamlit as st
 
+from pydantic import BaseModel, Field
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field
 
 
-# 1. Streamlit page setup
-st.set_page_config(page_title="Chat with PDF",layout="wide")
+# ==========================================
+# 1. PAGE CONFIGURATION
+# ==========================================
 
-st.title("Chat with PDF")
-st.write("Upload a PDF and ask questions about its content.")
-
-
-# 2. Define the structured answer
-class PDFAnswer(BaseModel):
-    answer: str = Field(description="Answer based on the PDF")
-    found_in_document: bool = Field(description="Whether the answer is supported by the PDF")
-    source_pages: list[int] = Field(description="Relevant PDF page numbers, starting from 1")
-
-
-parser = PydanticOutputParser( pydantic_object=PDFAnswer)
-
-
-# 3. Initialize the embedding model and LLM
-@st.cache_resource
-def load_models():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-    llm = ChatOllama(model="llama3.2:1b",temperature=0 )
-    return embeddings, llm
-
-
-# 4. Create the prompt
-prompt = PromptTemplate(
-    template="""
-You answer questions using the provided PDF context.
-
-Rules:
-- Answer only using information supported by the context.
-- If the answer is not present, set found_in_document to false.
-- Return a valid JSON object, not a JSON schema.
-- source_pages must contain the actual page numbers shown in the context.
-- If the answer is absent, use an empty source_pages list.
-
-{format_instructions}
-
-Context:{context}
-
-Question:{question}
-""",
-    input_variables=["context", "question"],
-    partial_variables={
-        "format_instructions": parser.get_format_instructions()
-    }
+st.set_page_config(
+    page_title="Chat with My PDF",
+    page_icon="📄",
+    layout="centered"
 )
 
 
-# 5. Upload PDF
-uploaded_file = st.file_uploader("Upload your PDF",type=["pdf"])
+# ==========================================
+# 2. CUSTOM CSS
+# ==========================================
+
+st.markdown("""
+<style>
+.stApp {
+    background-color: #111827;
+    color: white;
+}
+
+.title {
+    text-align: center;
+    font-size: 40px;
+    font-weight: bold;
+    color: #A78BFA;
+}
+
+.section {
+    font-size: 18px;
+    font-weight: bold;
+    color: white;
+    margin-top: 25px;
+}
+
+[data-testid="stChatInput"] {
+    background-color: #1E293B;
+}
+
+[data-testid="stChatInput"] textarea {
+    color: white !important;
+    -webkit-text-fill-color: white !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
-# 6. Process the PDF
-if uploaded_file is not None:
-    if (
-        st.session_state.get("uploaded_file_name")
-        != uploaded_file.name
-    ):
-        st.session_state.pop("retriever", None)
-        st.session_state.pop("uploaded_file_name", None)
+# ==========================================
+# 3. TITLE AND UPLOAD FOLDER
+# ==========================================
 
-    if st.button("Process PDF"):
-        os.makedirs("uploads", exist_ok=True)
+st.markdown(
+    '<div class="title">📄 Chat with My PDF</div>',
+    unsafe_allow_html=True
+)
 
-        pdf_path = os.path.join(
-            "uploads",uploaded_file.name)
+UPLOAD_FOLDER = "uploaded_files"
+DB_FOLDER = "my_chroma_db"
 
-        with open(pdf_path, "wb") as file:
-            file.write(uploaded_file.getvalue())
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ==========================================
+# 4. PYDANTIC OUTPUT MODEL
+# ==========================================
+
+class PDFAnswer(BaseModel):
+    answer: str = Field(
+        description="Answer to the user's question based on the PDF"
+    )
+
+
+# ==========================================
+# 5. INITIALIZE LLM
+# ==========================================
+
+@st.cache_resource
+def load_llm():
+    model = ChatOllama(
+        model="llama3.2:1b",
+        temperature=0
+    )
+
+    return model.with_structured_output(
+        PDFAnswer,
+        method="json_schema"
+    )
+
+
+try:
+    structured_llm = load_llm()
+except Exception as e:
+    st.error(f"Could not initialize Ollama: {e}")
+    st.stop()
+
+
+# ==========================================
+# 6. PROMPT AND CHAIN
+# ==========================================
+
+prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """
+You are a helpful PDF question-answering assistant.
+
+Rules:
+1. Answer using only the provided PDF context.
+2. Give a clear and simple answer.
+3. If the answer is not present in the context,
+   say: "The answer is not available in the provided PDF."
+4. Return the answer in the required structured format.
+5. Do not return a JSON schema as the answer.
+
+PDF Context:
+{context}
+"""
+    ),
+    ("human", "{question}")
+])
+
+chain = prompt | structured_llm
+
+
+# ==========================================
+# 7. SESSION STATE
+# ==========================================
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+
+if "processed_pdf" not in st.session_state:
+    st.session_state.processed_pdf = None
+
+
+# ==========================================
+# 8. PDF UPLOAD
+# ==========================================
+
+st.markdown(
+    '<div class="section">📁 Upload your PDF</div>',
+    unsafe_allow_html=True
+)
+
+uploaded_file = st.file_uploader(
+    "Choose a PDF",
+    type=["pdf"]
+)
+
+
+# ==========================================
+# 9. PROCESS PDF
+# ==========================================
+
+if uploaded_file:
+
+    pdf_path = os.path.join(
+        UPLOAD_FOLDER,
+        os.path.basename(uploaded_file.name)
+    )
+
+    # Use the file content as well as the filename
+    # to identify a changed upload.
+    import hashlib
+
+    file_bytes = uploaded_file.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    if st.session_state.processed_pdf != file_hash:
 
         try:
-            with st.spinner("Reading and processing PDF..."):
-                documents = PyPDFLoader(pdf_path).load()
-                splitter = RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=100)
-                split_documents = splitter.split_documents(documents)
+            with st.spinner("Processing your PDF..."):
 
-                if not split_documents:
-                    st.error("No readable text was found in this PDF.")
+                # Save uploaded PDF
+                with open(pdf_path, "wb") as f:
+                    f.write(file_bytes)
+
+                # Load PDF
+                loader = PyPDFLoader(pdf_path)
+                documents = loader.load()
+
+                if not documents:
+                    st.error("No pages found in this PDF.")
                     st.stop()
 
-                embeddings, llm = load_models()
+                # Split text
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=150
+                )
 
-                # Fresh in-memory database for this uploaded PDF
-                vector_store = Chroma.from_documents(documents=split_documents,embedding=embeddings,collection_name="pdf_" + str(abs(hash(uploaded_file.name))))
+                chunks = splitter.split_documents(documents)
 
-                st.session_state.retriever = (vector_store.as_retriever(search_kwargs={"k": 4}))
-                st.session_state.llm = llm
-                st.session_state.uploaded_file_name = (uploaded_file.name)
-                st.success(f"PDF processed! Created {len(split_documents)} text chunks.")
+                if not chunks:
+                    st.error(
+                        "No readable text found. "
+                        "This PDF may contain scanned pages."
+                    )
+                    st.stop()
+
+                # Embeddings
+                embeddings = HuggingFaceEmbeddings(
+                    model_name="BAAI/bge-small-en-v1.5"
+                )
+
+                # Create a fresh collection for this uploaded PDF
+                vector_store = Chroma.from_documents(
+                    documents=chunks,
+                    embedding=embeddings,
+                    collection_name="pdf_" + file_hash[:20],
+                    persist_directory=DB_FOLDER
+                )
+
+                # MMR retriever
+                st.session_state.retriever = (
+                    vector_store.as_retriever(
+                        search_type="mmr",
+                        search_kwargs={
+                            "k": 3,
+                            "fetch_k": 10,
+                            "lambda_mult": 0.5
+                        }
+                    )
+                )
+
+                st.session_state.processed_pdf = file_hash
+                st.session_state.messages = []
+
+            st.success("PDF uploaded and processed successfully!")
 
         except Exception as e:
-            st.error(f"Could not process PDF: {e}")
+            st.error(f"Error processing PDF: {e}")
+            st.stop()
 
 
-# 7. Ask questions
-if "retriever" in st.session_state:
-    st.subheader("Ask a question")
+# ==========================================
+# 10. DISPLAY CHAT HISTORY
+# ==========================================
 
-    question = st.chat_input("For example: What programming languages are mentioned?")
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
 
-    if question:
-        st.chat_message("user").write(question)
 
-        with st.chat_message("assistant"):
-            try:
-                with st.spinner("Finding the answer..."):
-                    retriever = st.session_state.retriever
-                    llm = st.session_state.llm
+# ==========================================
+# 11. ASK QUESTIONS
+# ==========================================
 
-                    docs = retriever.invoke(question)
+st.markdown(
+    '<div class="section">💬 Ask your question</div>',
+    unsafe_allow_html=True
+)
 
-                    context = "\n\n".join(
-                        f"[Page {doc.metadata.get('page', 0) + 1}]\n"
-                        f"{doc.page_content}"
-                        for doc in docs
+query = st.chat_input("Ask anything about your PDF...")
+
+
+# ==========================================
+# 12. GENERATE ANSWER
+# ==========================================
+
+if query:
+
+    if st.session_state.retriever is None:
+
+        st.warning("Please upload a PDF first.")
+
+    else:
+
+        # Display user question
+        st.session_state.messages.append({
+            "role": "user",
+            "content": query
+        })
+
+        with st.chat_message("user"):
+            st.write(query)
+
+        try:
+            with st.chat_message("assistant"):
+
+                with st.spinner("Finding your answer..."):
+
+                    # Retrieve relevant chunks
+                    relevant_docs = (
+                        st.session_state.retriever.invoke(query)
                     )
 
-                    formatted_prompt = prompt.invoke({
-                        "context": context,
-                        "question": question
+                    # Build context
+                    context = "\n\n".join(
+                        doc.page_content
+                        for doc in relevant_docs
+                    )
+
+                    if not context.strip():
+                        answer = (
+                            "The answer is not available "
+                            "in the provided PDF."
+                        )
+                    else:
+                        # Generate structured answer
+                        result = chain.invoke({
+                            "context": context,
+                            "question": query
+                        })
+
+                        # Pydantic object or compatible dict
+                        if isinstance(result, PDFAnswer):
+                            answer = result.answer
+                        elif isinstance(result, dict):
+                            answer = result.get(
+                                "answer",
+                                "Unable to generate an answer."
+                            )
+                        else:
+                            answer = str(result)
+
+                    # Display answer
+                    st.write(answer)
+
+                    # Save answer to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer
                     })
 
-                    response = llm.invoke(formatted_prompt)
-                    result = parser.invoke(response.content)
+        except Exception as e:
+            st.error(
+                f"Error generating answer: {e}"
+            )
 
-                st.write(result.answer)
 
-                if result.found_in_document:
-                    st.caption(
-                        "Found in the document: Yes"
-                    )
-                else:
-                    st.caption(
-                        "Found in the document: No"
-                    )
+# ==========================================
+# 13. FOOTER
+# ==========================================
 
-                if result.source_pages:
-                    st.caption(
-                        "Source pages: "
-                        + ", ".join(
-                            str(page)
-                            for page in result.source_pages
-                        )
-                    )
-
-            except Exception as e:
-                st.error(f"Could not generate the answer: {e}")
+st.markdown(
+    """
+    <p style='text-align:center; color:#9CA3AF; margin-top:40px;'>
+        Powered by Generative AI | Built with Streamlit
+    </p>
+    """,
+    unsafe_allow_html=True
+)
